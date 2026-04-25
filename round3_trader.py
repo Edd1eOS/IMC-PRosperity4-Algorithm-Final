@@ -86,6 +86,8 @@ HYD_INV_HARD_CAP  = 100     # absolute pos limit: only reduce-side quotes beyond
 ENABLE_OPTIONS    = False    # master switch: set True to re-enable directional voucher trades
 UNWIND_THRESHOLD  = 15       # |pos| > this triggers active taker unwind
 UNWIND_LOT        = 15       # contracts per taker unwind tick (= HYD_LOT for equilibrium)
+HYD_DN_TAKER_CAP  = -12      # directional taker short: stop building when pos reaches this
+HYD_DN_TAKER_LOT  = 5        # lot per directional taker fire (keeps taker cost bounded)
 
 # Logger / state
 MAX_LOG_LEN       = 3750
@@ -489,6 +491,15 @@ def hydrogel_orders(od, pos, spread_hist, prev_mid, logger):
     in_long_emergency  = pos > UNWIND_THRESHOLD
     price_rising  = prev_mid is not None and mp > prev_mid
     price_falling = prev_mid is not None and mp < prev_mid
+
+    # Directional taker short: build short position during downtrend when pos is too light.
+    # Only fires when price is falling and current pos is above the target short cap.
+    if price_falling and not hard_short and sim_pos > HYD_DN_TAKER_CAP:
+        room = min(HYD_LIMIT + sim_pos, HYD_DN_TAKER_LOT, sim_pos - HYD_DN_TAKER_CAP)
+        if room > 0:
+            orders.append(Order(SYM_HYD, bb, -room))
+            sim_pos -= room
+            logger.log("HYD DN TAKER " + str(room) + "@" + str(bb))
 
     if in_short_emergency and not hard_long and price_rising:
         qty = min(UNWIND_LOT, HYD_LIMIT - sim_pos)
