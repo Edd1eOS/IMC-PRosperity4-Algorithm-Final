@@ -88,11 +88,11 @@ ZONE_HIGH_ENTER   = 9990     # price crosses above this: zone -> HIGH (short-bia
 ZONE_HIGH_EXIT    = 9960     # price crosses below this: zone HIGH -> MID
 ZONE_LOW_ENTER    = 9945     # price crosses below this: zone -> LOW (buy-biased, bid only + unwind)
 ZONE_LOW_EXIT     = 9980     # price crosses above this: zone LOW -> MID
-LOW_UNWIND_THRESH = 10       # |short pos| > this in LOW zone: taker-buy to reduce
+LOW_UNWIND_THRESH = 4        # |short pos| > this in LOW zone: taker-buy to reduce
 LOW_UNWIND_LOT    = 10       # lot per taker-buy in LOW zone
-HYD_SHORT_HARD_CAP = -16     # absolute max short position in HIGH zone (hard inventory cap)
+HYD_SHORT_HARD_CAP = -12     # absolute max short position in HIGH zone (hard inventory cap)
 MID_TAKER_FORCED_BUY_LOT = 12  # aggressively buy back shorts in MID zone
-MID_TAKER_FORCED_BUY_THRESH = -10  # only if pos < this in MID
+MID_TAKER_FORCED_BUY_THRESH = -8   # only if pos <= this in MID
 
 # Logger / state
 MAX_LOG_LEN       = 3750
@@ -475,7 +475,7 @@ def hydrogel_orders(od, pos, spread_hist, zone, logger):
 
     # MID zone forced taker buy: when in MID zone and carrying significant short,
     # aggressively buy back to compress position and reduce upswing drawdown.
-    if zone == "MID" and pos < MID_TAKER_FORCED_BUY_THRESH and not hard_long:
+    if zone == "MID" and pos <= MID_TAKER_FORCED_BUY_THRESH and not hard_long:
         if ba is not None:
             room = HYD_LIMIT - sim_pos
             qty = min(MID_TAKER_FORCED_BUY_LOT, od.sell_orders.get(ba, 0), room)
@@ -514,10 +514,9 @@ def hydrogel_orders(od, pos, spread_hist, zone, logger):
     # Added: HIGH zone absolute short cap (HYD_SHORT_HARD_CAP); MID zone sell prohibition
     if zone == "HIGH":
         buy_room = 0
-        if pos <= HYD_SHORT_HARD_CAP:
-            sell_room = 0  # enforce hard cap: no new shorts beyond limit
-        else:
-            sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT)
+        # Strict cap sizing: never post more ask size than remaining room to hard cap.
+        room_to_cap = max(0, sim_pos - HYD_SHORT_HARD_CAP)
+        sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT, room_to_cap)
     elif zone == "LOW":
         buy_room  = 0 if hard_long else min(HYD_LIMIT - sim_pos, HYD_LOT)
         sell_room = 0
