@@ -88,9 +88,13 @@ ZONE_HIGH_ENTER   = 9990     # price crosses above this: zone -> HIGH (short-bia
 ZONE_HIGH_EXIT    = 9960     # price crosses below this: zone HIGH -> MID
 ZONE_LOW_ENTER    = 9945     # price crosses below this: zone -> LOW (buy-biased, bid only + unwind)
 ZONE_LOW_EXIT     = 9980     # price crosses above this: zone LOW -> MID
-LOW_UNWIND_THRESH = 4        # |short pos| > this in LOW zone: taker-buy to reduce
+LOW_UNWIND_THRESH_EARLY = 4  # early stage: stronger short compression in LOW
+LOW_UNWIND_THRESH_LATE  = 6  # late stage: keep more short inventory for upside capture
+LOW_UNWIND_SWITCH_TS    = 65000
 LOW_UNWIND_LOT    = 10       # lot per taker-buy in LOW zone
-HYD_SHORT_HARD_CAP = -12     # absolute max short position in HIGH zone (hard inventory cap)
+HYD_SHORT_HARD_CAP_EARLY = -12  # early stage: protect first climb from heavy short carry
+HYD_SHORT_HARD_CAP_LATE  = -14  # late stage: allow a bit more inventory for upside
+HYD_CAP_SWITCH_TS        = 60000
 MID_TAKER_FORCED_BUY_LOT = 12  # aggressively buy back shorts in MID zone
 MID_TAKER_FORCED_BUY_THRESH = -8   # only if pos <= this in MID
 
@@ -440,7 +444,7 @@ def voucher_and_hedge_orders(
 # ================================================================
 # Module B: HYDROGEL market maker (clean-slate, no R1/R2 heritage)
 # ================================================================
-def hydrogel_orders(od, pos, spread_hist, zone, logger):
+def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
     bb, ba = best_bid_ask(od)
     if bb is None or ba is None:
         return []
@@ -473,12 +477,17 @@ def hydrogel_orders(od, pos, spread_hist, zone, logger):
     hard_long  = pos >= HYD_INV_HARD_CAP
     hard_short = pos <= -HYD_INV_HARD_CAP
 
+    active_short_cap = HYD_SHORT_HARD_CAP_EARLY if timestamp < HYD_CAP_SWITCH_TS else HYD_SHORT_HARD_CAP_LATE
+    low_unwind_thresh = LOW_UNWIND_THRESH_EARLY if timestamp < LOW_UNWIND_SWITCH_TS else LOW_UNWIND_THRESH_LATE
+
     # MID zone forced taker buy: when in MID zone and carrying significant short,
     # aggressively buy back to compress position and reduce upswing drawdown.
     if zone == "MID" and pos <= MID_TAKER_FORCED_BUY_THRESH and not hard_long:
         if ba is not None:
             room = HYD_LIMIT - sim_pos
-            qty = min(MID_TAKER_FORCED_BUY_LOT, od.sell_orders.get(ba, 0), room)
+            # IMC sell-side depth is negative in many books; use absolute available size.
+            ba_liq = abs(od.sell_orders.get(ba, 0))
+            qty = min(MID_TAKER_FORCED_BUY_LOT, ba_liq, room)
             if qty > 0:
                 orders.append(Order(SYM_HYD, ba, qty))
                 sim_pos += qty
@@ -503,19 +512,19 @@ def hydrogel_orders(od, pos, spread_hist, zone, logger):
             logger.log("HYD HIT " + str(qty) + "@" + str(bb))
 
     # Zone taker unwind: in LOW zone, if still carrying a short, cross spread to reduce.
-    if zone == "LOW" and pos < -LOW_UNWIND_THRESH and not hard_long:
-        qty = min(LOW_UNWIND_LOT, HYD_LIMIT - sim_pos, (-pos) - LOW_UNWIND_THRESH)
+    if zone == "LOW" and pos < -low_unwind_thresh and not hard_long:
+        qty = min(LOW_UNWIND_LOT, HYD_LIMIT - sim_pos, (-pos) - low_unwind_thresh)
         if qty > 0:
             orders.append(Order(SYM_HYD, ba, qty))
             sim_pos += qty
             logger.log("HYD ZONE UNWIND " + str(qty) + "@" + str(ba))
 
     # Zone-controlled maker: HIGH = ask only (build short); LOW = bid only (close short); MID = both
-    # Added: HIGH zone absolute short cap (HYD_SHORT_HARD_CAP); MID zone sell prohibition
+    # Added: HIGH zone absolute short cap (time-adaptive); MID zone sell prohibition
     if zone == "HIGH":
         buy_room = 0
         # Strict cap sizing: never post more ask size than remaining room to hard cap.
-        room_to_cap = max(0, sim_pos - HYD_SHORT_HARD_CAP)
+        room_to_cap = max(0, sim_pos - active_short_cap)
         sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT, room_to_cap)
     elif zone == "LOW":
         buy_room  = 0 if hard_long else min(HYD_LIMIT - sim_pos, HYD_LOT)
@@ -590,7 +599,7 @@ class Trader:
                             hyd_zone = "HIGH"
                         elif cur_mid < ZONE_LOW_ENTER:
                             hyd_zone = "LOW"
-                b_orders = hydrogel_orders(od_hyd, pos_hyd, hyd_spread_hist, hyd_zone, logger)
+                b_orders = hydrogel_orders(od_hyd, pos_hyd, hyd_spread_hist, hyd_zone, state.timestamp, logger)
                 if b_orders:
                     result.setdefault(SYM_HYD, []).extend(b_orders)
         except Exception as e:
