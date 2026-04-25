@@ -102,6 +102,16 @@ MID_TAKER_LATE_BUY_TARGET  = -6
 HIGH_LATE_TAKER_SELL_START_TS = 68000
 HIGH_LATE_TAKER_SELL_TARGET   = -8
 HIGH_LATE_TAKER_SELL_LOT      = 4
+# ===== PHASED POSITION MANAGEMENT (v2.9) =====
+# Three-phase lifecycle: A=early build, B=mid-cycle reduce, C=late defend
+HYD_PHASE_A_THRESH       = 40000   # Phase A (accumulation): 0-40k
+HYD_PHASE_B_THRESH       = 70000   # Phase B (reduction): 40k-70k; Phase C (defense): 70k+
+HYD_PHASE_A_SHORT_CAP    = -35     # Phase A: allow up to -35 short
+HYD_PHASE_B_SHORT_CAP    = -30     # Phase B: tighter cap at -30 to force reduction
+HYD_PHASE_C_SHORT_CAP    = -20     # Phase C: very tight cap at -20 for rapid exit prep
+HYD_PHASE_B_REDUCE_START = 50000   # Within Phase B, start aggressive reduction at 50k
+HYD_PHASE_B_REDUCE_TARGET= -25     # Phase B reduction target: buy back to -25 max
+HYD_PHASE_B_REDUCE_LOT   = 6       # Lot size per reduction taker buy in Phase B
 
 # Logger / state
 MAX_LOG_LEN       = 3750
@@ -478,13 +488,37 @@ def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
     orders = []
     sim_pos = pos
 
+    # ===== PHASE DETECTION (v2.9) =====
+    if timestamp < HYD_PHASE_A_THRESH:
+        phase = "A"
+        active_short_cap = HYD_PHASE_A_SHORT_CAP
+    elif timestamp < HYD_PHASE_B_THRESH:
+        phase = "B"
+        active_short_cap = HYD_PHASE_B_SHORT_CAP
+    else:
+        phase = "C"
+        active_short_cap = HYD_PHASE_C_SHORT_CAP
+
     # Hard inventory cap: beyond HYD_INV_HARD_CAP only allow reduce-side activity
     hard_long  = pos >= HYD_INV_HARD_CAP
     hard_short = pos <= -HYD_INV_HARD_CAP
 
-    active_short_cap = HYD_SHORT_HARD_CAP_EARLY if timestamp < HYD_CAP_SWITCH_TS else HYD_SHORT_HARD_CAP_LATE
     low_unwind_thresh = LOW_UNWIND_THRESH_EARLY if timestamp < LOW_UNWIND_SWITCH_TS else LOW_UNWIND_THRESH_LATE
     late_mid_cover = timestamp >= HIGH_LATE_TAKER_SELL_START_TS
+
+    # ===== PHASE B AGGRESSIVELY REDUCE SHORT (v2.9) =====
+    # In Phase B (40k-70k), after first round of accumulation, aggressively unwind shorts.
+    # This prevents the "flat trap" where position sits wrong for 15k seconds.
+    if phase == "B" and timestamp >= HYD_PHASE_B_REDUCE_START and pos <= HYD_PHASE_B_REDUCE_TARGET and not hard_long:
+        if ba is not None:
+            room = HYD_LIMIT - sim_pos
+            ba_liq = abs(od.sell_orders.get(ba, 0))
+            reduce_need = max(0, HYD_PHASE_B_REDUCE_TARGET - sim_pos)
+            qty = min(HYD_PHASE_B_REDUCE_LOT, ba_liq, room, reduce_need)
+            if qty > 0:
+                orders.append(Order(SYM_HYD, ba, qty))
+                sim_pos += qty
+                logger.log("HYD PHASE_B REDUCE " + str(qty) + "@" + str(ba))
 
     # MID zone forced taker buy: when in MID zone and carrying significant short,
     # aggressively buy back to compress position and reduce upswing drawdown.
