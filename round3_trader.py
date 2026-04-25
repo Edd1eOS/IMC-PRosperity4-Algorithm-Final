@@ -84,10 +84,12 @@ HYD_SPREAD_WINDOW = 20
 HYD_TAKER_PAD     = 1
 HYD_INV_HARD_CAP  = 100     # absolute pos limit: only reduce-side quotes beyond this
 ENABLE_OPTIONS    = False    # master switch: set True to re-enable directional voucher trades
-UNWIND_THRESHOLD  = 15       # |pos| > this triggers active taker unwind
-UNWIND_LOT        = 15       # contracts per taker unwind tick (= HYD_LOT for equilibrium)
-HYD_DN_TAKER_CAP  = -12      # directional taker short: stop building when pos reaches this
-HYD_DN_TAKER_LOT  = 5        # lot per directional taker fire (keeps taker cost bounded)
+ZONE_HIGH_ENTER   = 9990     # price crosses above this: zone -> HIGH (short-biased, ask only)
+ZONE_HIGH_EXIT    = 9960     # price crosses below this: zone HIGH -> MID
+ZONE_LOW_ENTER    = 9945     # price crosses below this: zone -> LOW (buy-biased, bid only + unwind)
+ZONE_LOW_EXIT     = 9980     # price crosses above this: zone LOW -> MID
+LOW_UNWIND_THRESH = 10       # |short pos| > this in LOW zone: taker-buy to reduce
+LOW_UNWIND_LOT    = 10       # lot per taker-buy in LOW zone
 
 # Logger / state
 MAX_LOG_LEN       = 3750
@@ -435,7 +437,7 @@ def voucher_and_hedge_orders(
 # ================================================================
 # Module B: HYDROGEL market maker (clean-slate, no R1/R2 heritage)
 # ================================================================
-def hydrogel_orders(od, pos, spread_hist, prev_mid, logger):
+def hydrogel_orders(od, pos, spread_hist, zone, logger):
     bb, ba = best_bid_ask(od)
     if bb is None or ba is None:
         return []
@@ -484,39 +486,24 @@ def hydrogel_orders(od, pos, spread_hist, prev_mid, logger):
             sim_pos -= qty
             logger.log("HYD HIT " + str(qty) + "@" + str(bb))
 
-    # Active unwind: when inventory is extreme, cross the spread to reduce position.
-    # Momentum gate: only unwind short when price is rising (loss phase);
-    # suppress unwind during downtrend so profitable shorts are not prematurely closed.
-    in_short_emergency = pos < -UNWIND_THRESHOLD
-    in_long_emergency  = pos > UNWIND_THRESHOLD
-    price_rising  = prev_mid is not None and mp > prev_mid
-    price_falling = prev_mid is not None and mp < prev_mid
-
-    # Directional taker short: build short position during downtrend when pos is too light.
-    # Only fires when price is falling and current pos is above the target short cap.
-    if price_falling and not hard_short and sim_pos > HYD_DN_TAKER_CAP:
-        room = min(HYD_LIMIT + sim_pos, HYD_DN_TAKER_LOT, sim_pos - HYD_DN_TAKER_CAP)
-        if room > 0:
-            orders.append(Order(SYM_HYD, bb, -room))
-            sim_pos -= room
-            logger.log("HYD DN TAKER " + str(room) + "@" + str(bb))
-
-    if in_short_emergency and not hard_long and price_rising:
-        qty = min(UNWIND_LOT, HYD_LIMIT - sim_pos)
+    # Zone taker unwind: in LOW zone, if still carrying a short, cross spread to reduce.
+    if zone == "LOW" and pos < -LOW_UNWIND_THRESH and not hard_long:
+        qty = min(LOW_UNWIND_LOT, HYD_LIMIT - sim_pos, (-pos) - LOW_UNWIND_THRESH)
         if qty > 0:
             orders.append(Order(SYM_HYD, ba, qty))
             sim_pos += qty
-            logger.log("HYD UNWIND BUY " + str(qty) + "@" + str(ba))
-    elif in_long_emergency and not hard_short and price_falling:
-        qty = min(UNWIND_LOT, HYD_LIMIT + sim_pos)
-        if qty > 0:
-            orders.append(Order(SYM_HYD, bb, -qty))
-            sim_pos -= qty
-            logger.log("HYD UNWIND SELL " + str(qty) + "@" + str(bb))
+            logger.log("HYD ZONE UNWIND " + str(qty) + "@" + str(ba))
 
-    # Maker phase: suppress the side that worsens inventory during emergency
-    buy_room  = 0 if (hard_long  or in_long_emergency)  else min(HYD_LIMIT - sim_pos, HYD_LOT)
-    sell_room = 0 if (hard_short or in_short_emergency) else min(HYD_LIMIT + sim_pos, HYD_LOT)
+    # Zone-controlled maker: HIGH = ask only (build short); LOW = bid only (close short); MID = both
+    if zone == "HIGH":
+        buy_room  = 0
+        sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT)
+    elif zone == "LOW":
+        buy_room  = 0 if hard_long else min(HYD_LIMIT - sim_pos, HYD_LOT)
+        sell_room = 0
+    else:
+        buy_room  = 0 if hard_long  else min(HYD_LIMIT - sim_pos, HYD_LOT)
+        sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT)
     if buy_room > 0:
         orders.append(Order(SYM_HYD, bid_px, buy_room))
     if sell_room > 0:
@@ -543,7 +530,7 @@ class Trader:
         if not isinstance(vrp_state, dict):
             vrp_state = {}
         hyd_spread_hist = list(mem.get("hyd_spread", []))
-        hyd_prev_mid    = mem.get("hyd_prev_mid", None)
+        hyd_zone        = mem.get("hyd_zone", "MID")
 
         # -- Module A: vouchers + underlying delta hedge --
         try:
@@ -571,8 +558,20 @@ class Trader:
             if SYM_HYD in state.order_depths:
                 od_hyd = state.order_depths[SYM_HYD]
                 pos_hyd = state.position.get(SYM_HYD, 0)
-                b_orders = hydrogel_orders(od_hyd, pos_hyd, hyd_spread_hist, hyd_prev_mid, logger)
-                hyd_prev_mid = microprice(od_hyd)
+                cur_mid = microprice(od_hyd)
+                if cur_mid is not None:
+                    if hyd_zone == "HIGH":
+                        if cur_mid < ZONE_HIGH_EXIT:
+                            hyd_zone = "MID"
+                    elif hyd_zone == "LOW":
+                        if cur_mid > ZONE_LOW_EXIT:
+                            hyd_zone = "MID"
+                    else:
+                        if cur_mid > ZONE_HIGH_ENTER:
+                            hyd_zone = "HIGH"
+                        elif cur_mid < ZONE_LOW_ENTER:
+                            hyd_zone = "LOW"
+                b_orders = hydrogel_orders(od_hyd, pos_hyd, hyd_spread_hist, hyd_zone, logger)
                 if b_orders:
                     result.setdefault(SYM_HYD, []).extend(b_orders)
         except Exception as e:
@@ -604,9 +603,9 @@ class Trader:
             result[sym] = clamped
 
         # -- state serialize --
-        mem["vrp"]        = vrp_state
-        mem["hyd_spread"]  = hyd_spread_hist[-HYD_SPREAD_WINDOW:]
-        mem["hyd_prev_mid"] = hyd_prev_mid
+        mem["vrp"]       = vrp_state
+        mem["hyd_spread"] = hyd_spread_hist[-HYD_SPREAD_WINDOW:]
+        mem["hyd_zone"]   = hyd_zone
         td = json.dumps(mem, separators=(",", ":"))
         if len(td) > MAX_TRADER_DATA:
             if "rv_hist" in mem.get("vrp", {}):
