@@ -90,6 +90,9 @@ ZONE_LOW_ENTER    = 9945     # price crosses below this: zone -> LOW (buy-biased
 ZONE_LOW_EXIT     = 9980     # price crosses above this: zone LOW -> MID
 LOW_UNWIND_THRESH = 10       # |short pos| > this in LOW zone: taker-buy to reduce
 LOW_UNWIND_LOT    = 10       # lot per taker-buy in LOW zone
+EXIT_ARMED_THRESH = 14       # when HIGH->MID, activate exit_armed if |pos| > this
+EXIT_ARMED_LOT    = 8        # taker buy lots per tick in exit_armed mode
+EXIT_ARMED_PAD    = 2        # buy only if best_ask <= microprice + this (close to fair value)
 
 # Logger / state
 MAX_LOG_LEN       = 3750
@@ -437,7 +440,7 @@ def voucher_and_hedge_orders(
 # ================================================================
 # Module B: HYDROGEL market maker (clean-slate, no R1/R2 heritage)
 # ================================================================
-def hydrogel_orders(od, pos, spread_hist, zone, logger):
+def hydrogel_orders(od, pos, spread_hist, zone, exit_armed, logger):
     bb, ba = best_bid_ask(od)
     if bb is None or ba is None:
         return []
@@ -470,6 +473,17 @@ def hydrogel_orders(od, pos, spread_hist, zone, logger):
     hard_long  = pos >= HYD_INV_HARD_CAP
     hard_short = pos <= -HYD_INV_HARD_CAP
 
+    # Exit-armed taker buy: in MID zone after HIGH->MID transition, aggressively buy back shorts
+    # to improve buyer/seller time alignment and reduce upswing drawdown.
+    if exit_armed and zone == "MID" and pos < -EXIT_ARMED_THRESH and not hard_long:
+        if ba is not None and ba <= mp + EXIT_ARMED_PAD:
+            room = HYD_LIMIT - sim_pos
+            qty = min(EXIT_ARMED_LOT, od.sell_orders.get(ba, 0), room)
+            if qty > 0:
+                orders.append(Order(SYM_HYD, ba, qty))
+                sim_pos += qty
+                logger.log("HYD EXIT_ARMED BUY " + str(qty) + "@" + str(ba))
+
     # Taker phase: aggress when book is mispriced relative to microprice
     if not hard_long and ba < mp - edge - HYD_TAKER_PAD:
         room = HYD_LIMIT - sim_pos
@@ -478,9 +492,9 @@ def hydrogel_orders(od, pos, spread_hist, zone, logger):
             orders.append(Order(SYM_HYD, ba, qty))
             sim_pos += qty
             logger.log("HYD TAKE " + str(qty) + "@" + str(ba))
-    # In HIGH zone, avoid aggressive short extension via taker sells.
-    # Keep short-building mostly on passive maker asks for smoother drawdown control.
-    if zone != "HIGH" and not hard_short and bb > mp + edge + HYD_TAKER_PAD:
+    # In HIGH zone and LOW zone, avoid aggressive short extension via taker sells.
+    # LOW zone: focus on closing shorts; HIGH zone: use passive maker only for smoother control.
+    if zone not in ["HIGH", "LOW"] and not hard_short and bb > mp + edge + HYD_TAKER_PAD:
         room = HYD_LIMIT + sim_pos
         qty = min(od.buy_orders[bb], room, HYD_LOT)
         if qty > 0:
@@ -497,15 +511,20 @@ def hydrogel_orders(od, pos, spread_hist, zone, logger):
             logger.log("HYD ZONE UNWIND " + str(qty) + "@" + str(ba))
 
     # Zone-controlled maker: HIGH = ask only (build short); LOW = bid only (close short); MID = both
+    # In exit_armed MID mode, force sell_room=0 to prevent counter-productive short extension
     if zone == "HIGH":
         buy_room  = 0
         sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT)
     elif zone == "LOW":
         buy_room  = 0 if hard_long else min(HYD_LIMIT - sim_pos, HYD_LOT)
         sell_room = 0
-    else:
-        buy_room  = 0 if hard_long  else min(HYD_LIMIT - sim_pos, HYD_LOT)
-        sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT)
+    else:  # MID
+        if exit_armed and pos < -EXIT_ARMED_THRESH:
+            buy_room  = 0 if hard_long else min(HYD_LIMIT - sim_pos, HYD_LOT)
+            sell_room = 0
+        else:
+            buy_room  = 0 if hard_long  else min(HYD_LIMIT - sim_pos, HYD_LOT)
+            sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT)
     if buy_room > 0:
         orders.append(Order(SYM_HYD, bid_px, buy_room))
     if sell_room > 0:
@@ -533,6 +552,7 @@ class Trader:
             vrp_state = {}
         hyd_spread_hist = list(mem.get("hyd_spread", []))
         hyd_zone        = mem.get("hyd_zone", "MID")
+        hyd_exit_armed  = mem.get("hyd_exit_armed", False)
 
         # -- Module A: vouchers + underlying delta hedge --
         try:
@@ -562,18 +582,26 @@ class Trader:
                 pos_hyd = state.position.get(SYM_HYD, 0)
                 cur_mid = microprice(od_hyd)
                 if cur_mid is not None:
+                    prev_zone = hyd_zone
                     if hyd_zone == "HIGH":
                         if cur_mid < ZONE_HIGH_EXIT:
                             hyd_zone = "MID"
+                            hyd_exit_armed = True
                     elif hyd_zone == "LOW":
                         if cur_mid > ZONE_LOW_EXIT:
                             hyd_zone = "MID"
-                    else:
+                            hyd_exit_armed = False
+                    else:  # MID
                         if cur_mid > ZONE_HIGH_ENTER:
                             hyd_zone = "HIGH"
+                            hyd_exit_armed = False
                         elif cur_mid < ZONE_LOW_ENTER:
                             hyd_zone = "LOW"
-                b_orders = hydrogel_orders(od_hyd, pos_hyd, hyd_spread_hist, hyd_zone, logger)
+                            hyd_exit_armed = False
+                    # Deactivate exit_armed if short position becomes shallow
+                    if pos_hyd >= -EXIT_ARMED_THRESH + 2:
+                        hyd_exit_armed = False
+                b_orders = hydrogel_orders(od_hyd, pos_hyd, hyd_spread_hist, hyd_zone, hyd_exit_armed, logger)
                 if b_orders:
                     result.setdefault(SYM_HYD, []).extend(b_orders)
         except Exception as e:
@@ -608,6 +636,7 @@ class Trader:
         mem["vrp"]       = vrp_state
         mem["hyd_spread"] = hyd_spread_hist[-HYD_SPREAD_WINDOW:]
         mem["hyd_zone"]   = hyd_zone
+        mem["hyd_exit_armed"] = hyd_exit_armed
         td = json.dumps(mem, separators=(",", ":"))
         if len(td) > MAX_TRADER_DATA:
             if "rv_hist" in mem.get("vrp", {}):
