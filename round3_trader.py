@@ -478,7 +478,9 @@ def hydrogel_orders(od, pos, spread_hist, zone, logger):
             orders.append(Order(SYM_HYD, ba, qty))
             sim_pos += qty
             logger.log("HYD TAKE " + str(qty) + "@" + str(ba))
-    if not hard_short and bb > mp + edge + HYD_TAKER_PAD:
+    # In HIGH zone, avoid aggressive short extension via taker sells.
+    # Keep short-building mostly on passive maker asks for smoother drawdown control.
+    if zone != "HIGH" and not hard_short and bb > mp + edge + HYD_TAKER_PAD:
         room = HYD_LIMIT + sim_pos
         qty = min(od.buy_orders[bb], room, HYD_LOT)
         if qty > 0:
