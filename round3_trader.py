@@ -97,6 +97,9 @@ HYD_SHORT_HARD_CAP_LATE  = -14  # late stage: allow a bit more inventory for ups
 HYD_CAP_SWITCH_TS        = 60000
 MID_TAKER_FORCED_BUY_LOT = 12  # aggressively buy back shorts in MID zone
 MID_TAKER_FORCED_BUY_THRESH = -8   # only if pos <= this in MID
+HIGH_LATE_TAKER_SELL_START_TS = 68000
+HIGH_LATE_TAKER_SELL_TARGET   = -8
+HIGH_LATE_TAKER_SELL_LOT      = 4
 
 # Logger / state
 MAX_LOG_LEN       = 3750
@@ -510,6 +513,17 @@ def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
             orders.append(Order(SYM_HYD, bb, -qty))
             sim_pos -= qty
             logger.log("HYD HIT " + str(qty) + "@" + str(bb))
+
+    # After the big first unwind, passive HIGH asks rebuild too slowly.
+    # Late in the day, allow a small forced sell in HIGH to recover downswing capture.
+    if zone == "HIGH" and timestamp >= HIGH_LATE_TAKER_SELL_START_TS and not hard_short:
+        room = HYD_LIMIT + sim_pos
+        target_room = max(0, sim_pos - HIGH_LATE_TAKER_SELL_TARGET)
+        qty = min(HIGH_LATE_TAKER_SELL_LOT, od.buy_orders.get(bb, 0), room, target_room)
+        if qty > 0:
+            orders.append(Order(SYM_HYD, bb, -qty))
+            sim_pos -= qty
+            logger.log("HYD HIGH RELOAD SELL " + str(qty) + "@" + str(bb))
 
     # Zone taker unwind: in LOW zone, if still carrying a short, cross spread to reduce.
     if zone == "LOW" and pos < -low_unwind_thresh and not hard_long:
