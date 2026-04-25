@@ -97,6 +97,8 @@ HYD_SHORT_HARD_CAP_LATE  = -14  # late stage: allow a bit more inventory for ups
 HYD_CAP_SWITCH_TS        = 60000
 MID_TAKER_FORCED_BUY_LOT = 12  # aggressively buy back shorts in MID zone
 MID_TAKER_FORCED_BUY_THRESH = -8   # only if pos <= this in MID
+MID_TAKER_LATE_BUY_LOT     = 6
+MID_TAKER_LATE_BUY_TARGET  = -6
 HIGH_LATE_TAKER_SELL_START_TS = 68000
 HIGH_LATE_TAKER_SELL_TARGET   = -8
 HIGH_LATE_TAKER_SELL_LOT      = 4
@@ -482,6 +484,7 @@ def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
 
     active_short_cap = HYD_SHORT_HARD_CAP_EARLY if timestamp < HYD_CAP_SWITCH_TS else HYD_SHORT_HARD_CAP_LATE
     low_unwind_thresh = LOW_UNWIND_THRESH_EARLY if timestamp < LOW_UNWIND_SWITCH_TS else LOW_UNWIND_THRESH_LATE
+    late_mid_cover = timestamp >= HIGH_LATE_TAKER_SELL_START_TS
 
     # MID zone forced taker buy: when in MID zone and carrying significant short,
     # aggressively buy back to compress position and reduce upswing drawdown.
@@ -490,7 +493,11 @@ def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
             room = HYD_LIMIT - sim_pos
             # IMC sell-side depth is negative in many books; use absolute available size.
             ba_liq = abs(od.sell_orders.get(ba, 0))
-            qty = min(MID_TAKER_FORCED_BUY_LOT, ba_liq, room)
+            if late_mid_cover:
+                trim_need = max(0, MID_TAKER_LATE_BUY_TARGET - sim_pos)
+                qty = min(MID_TAKER_LATE_BUY_LOT, ba_liq, room, trim_need)
+            else:
+                qty = min(MID_TAKER_FORCED_BUY_LOT, ba_liq, room)
             if qty > 0:
                 orders.append(Order(SYM_HYD, ba, qty))
                 sim_pos += qty
