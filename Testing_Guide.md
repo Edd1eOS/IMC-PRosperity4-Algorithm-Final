@@ -131,20 +131,22 @@ Agent 收到云端 log + PnL 后，必须按以下结构回复：
 
 ---
 
-## 5. v3.0 Cloud Validation Criteria (Inventory-State Refactor)
+## 5. v3.1 Cloud Validation Criteria (Dual-State + Stair Unwind)
 
 ### Required Log Signals
 1. `HYD TARGET BUY` appears with reason tags (`rs=`) and target (`tgt=`)
 2. `HYD HIGH RELOAD SELL` still appears in late HIGH regime
 3. No exception logs from Module B
+4. `rs=STAIR` appears in phase-B danger window (50k-70k)
+5. `rs=RISKOFF` appears when adverse carry streak is detected
 
 ### Segment-Level Acceptance Checks
-1. Early pressure segment (25.8k-32.7k): drawdown should shrink vs run 420388 baseline
-2. Mid over-cover segment (49k-53k): remove large one-way cover overshoot behavior
-3. Late downswing segment (76.8k-91k): retain more downside capture after reload
-4. Tail rebound segment (91k-99.9k): avoid excessive give-back
+1. Early pressure segment (25.8k-32.7k): drawdown should shrink vs run 465663 failure profile
+2. Mid collapse segment (50k-69k): avoid v3.0-style large positive-price / large-negative-PnL divergence
+3. Late downswing segment (76.8k-91k): retain downside capture after reload
+4. Tail rebound segment (91k-99.9k): reduce give-back versus 465663
 
 ### Decision Rule
-- Pass: PnL >= 1437 and at least 2/3 pressure segments improve
-- Strong pass: PnL >= 1500 with clear improvement in all 3 primary segments
-- Fail: PnL regression or pressure segments worsen
+- Pass: PnL >= 1437 and at least 3/4 segment checks improve versus 465663
+- Strong pass: PnL >= 1500 and all primary segments improve (early + mid + late)
+- Fail: PnL < 1300 or mid collapse segment repeats

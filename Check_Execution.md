@@ -244,7 +244,7 @@
 
 ---
 
-## Entry 003 ¡ª v3.0 ¡¤ Inventory-State Refactor Self Check
+## Entry 003 ï¿½ï¿½ v3.0 ï¿½ï¿½ Inventory-State Refactor Self Check
 
 - Date: 2026-04-26
 - Scope: `round3_trader.py` HYD module only
@@ -272,3 +272,37 @@
 - [x] Global clamping unchanged
 - [x] Hard caps (`hard_long`, `hard_short`) unchanged
 - [x] Module A untouched
+
+---
+
+## Entry 004 â€” v3.1 Â· Rollback + Dual-State Rewrite Self Check
+
+- Date: 2026-04-26
+- Scope: `round3_trader.py` HYD module on top of v2.9 rollback base
+
+### Syntax / Static
+- [x] AST parse pass
+- [x] Problems panel: no errors
+
+### Rollback Integrity
+- [x] Base restored from commit `f280808` before v3.1 rewrite
+- [x] Rewrite applied only to HYD constants + `hydrogel_orders` + HYD state serialize path
+
+### Functional Structure Checks
+- [x] `hydrogel_orders` signature uses `hyd_ctrl`
+- [x] All early exits return `(orders, hyd_ctrl)` tuple
+- [x] Dual-state logic present: phase state + risk mode state
+- [x] Phase-B stair unwind checkpoints present
+- [x] Unified target-buy path present (`HYD TARGET BUY` log)
+- [x] Capture lock extension on reload sell present
+- [x] HIGH maker sell disabled during risk-off
+
+### State Persistence Checks
+- [x] `hyd_ctrl` dict guard on deserialize
+- [x] `hyd_ctrl` persisted to traderData
+- [x] fields persisted: `prev_mp`, `adverse_up_streak`, `riskoff_until`, `capture_until`
+
+### Safety / Boundaries
+- [x] hard limit clamping unchanged
+- [x] no new external dependencies
+- [x] Module A and global clamp logic unchanged

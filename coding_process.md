@@ -1244,7 +1244,7 @@ LOW_UNWIND_THRESH = 10 / LOW_UNWIND_LOT = 10
 
 ---
 
-## Entry 016 ¡ª v3.0 ¡¤ HYD Inventory-State Refactor (Plan B Executed)
+## Entry 016 ï¿½ï¿½ v3.0 ï¿½ï¿½ HYD Inventory-State Refactor (Plan B Executed)
 
 - Version: v3.0
 - Date: 2026-04-26
@@ -1287,3 +1287,69 @@ LOW_UNWIND_THRESH = 10 / LOW_UNWIND_LOT = 10
   - 25.8k-32.7k drawdown compression
   - 49k over-cover elimination
   - 76.8k-91k downswing capture retention
+
+---
+
+## Entry 017 â€” v3.1 Â· Rollback to v2.9 and Dual-State Rewrite
+
+- Version: v3.1
+- Date: 2026-04-26
+- Trigger: v3.0 cloud run 465663 failed (PnL 1085; severe regression from 1437)
+
+### v3.0 Failure Postmortem (Cloud 465663)
+
+1. Early structural pressure returned:
+- 25.8k-32.7k: mid +27, PnL -329.68
+
+2. Mid structural pressure returned and worsened:
+- 50k-65k: mid +35, PnL -736.36
+- 62k-69k: mid +24, PnL -507.39
+
+3. Tail give-back expanded:
+- 91k-99.9k: mid +40, PnL -478.59
+
+Root cause summary:
+- v3.0 risk-state trigger was too brittle in live path (insufficient activation in critical windows)
+- reload/capture chain was under-fired in mid-late sequence
+- inventory control drifted from deterministic phase-B de-risk requirements
+
+### v3.1 Execution Plan (Approved) and Implementation
+
+Step A. Rollback base file to v2.9:
+- `git checkout f280808 -- round3_trader.py`
+
+Step B. Rebuild HYD controller on stable skeleton (no parameter-only tuning):
+1) Dual state machines:
+- Price-phase state: A/B/C via timestamp bands
+- Risk-mode state: NORMAL/RISKOFF/CAPTURE via streak + hold windows
+
+2) Phase-B stair unwind track (deterministic):
+- Time checkpoints: 50k / 56k / 62k / 68k
+- Target short trajectory: -20 -> -16 -> -12 -> -10
+
+3) Unified target controller:
+- All buy-side reduction paths (MID/LOW/PHASE-B/RISKOFF) merged into one capped path
+- Enforces monotonic convergence to `effective_cover_target`
+
+4) Capture lock after reload:
+- `HYD HIGH RELOAD SELL` extends `capture_until`
+- During capture lock, cover cannot go beyond `HYD_CAPTURE_MIN_SHORT`
+
+5) Risk-off maker policy:
+- Disable HIGH sell maker while `riskoff_active`
+- Prevent re-extension into wrong-way carry
+
+6) State persistence:
+- `hyd_ctrl` fields persisted in traderData: `prev_mp`, `adverse_up_streak`, `riskoff_until`, `capture_until`
+
+### Local Validation
+
+- Syntax parse: pass
+- Problems panel: no errors in `round3_trader.py`
+- Function return consistency: `hydrogel_orders(...) -> (orders, hyd_ctrl)` across all exit paths
+
+### Next Step
+
+- Upload v3.1 to cloud
+- Validate the same pressure segments against 420388 baseline and 465663 failure pattern
+

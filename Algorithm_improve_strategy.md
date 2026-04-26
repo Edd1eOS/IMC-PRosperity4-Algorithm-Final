@@ -228,3 +228,54 @@ Expected benefit direction:
 - Reduce early adverse carry duration
 - Remove branch-overlap over-cover events
 - Preserve late reload downswing participation
+
+---
+
+## 7. v3.1 Redesign After v3.0 Regression
+
+### Why v3.0 Failed in Cloud (465663)
+
+Observed regressions:
+- Early pressure returned (25.8k-32.7k drawdown)
+- Mid pressure sharply worsened (50k-69k two-step collapse)
+- Tail rebound give-back expanded
+
+Strategic conclusion:
+- The architecture direction (stateful inventory control) is correct.
+- The v3.0 activation path was too sparse and non-deterministic in key windows.
+- The controller must include a deterministic mid-cycle de-risk trajectory, not only signal-triggered behavior.
+
+### v3.1 Architecture
+
+v3.1 keeps the dual-state concept but adds deterministic structure:
+
+1. Price-phase state machine (A/B/C)
+- Still defines base inventory intent by market lifecycle.
+
+2. Risk-mode state machine (NORMAL/RISKOFF/CAPTURE)
+- RISKOFF: entered by adverse short-carry streak and held by timer.
+- CAPTURE: entered after late reload sells; temporarily preserves downside participation.
+
+3. Phase-B stair unwind track (deterministic)
+- 50k -> target -20
+- 56k -> target -16
+- 62k -> target -12
+- 68k -> target -10
+
+4. Unified effective-cover target
+- `effective_cover_target = max(base_phase_target, stair_target, riskoff_target)`
+- During capture lock: floor by `HYD_CAPTURE_MIN_SHORT`
+
+5. Maker policy gating
+- In HIGH zone, no sell-maker extension during RISKOFF
+- LOW/MID maker buy sizes bounded by target need
+
+### Strategic Intent of v3.1
+
+The key shift is from mostly reactive branch firing to mixed reactive + deterministic control:
+- Deterministic in the 50k-70k danger window (stair unwind)
+- Reactive outside that window (risk streak and capture lock)
+
+This is designed to prevent recurrence of both historical structural failures:
+- wrong-way carry persistence
+- over-cover and under-capture oscillation
