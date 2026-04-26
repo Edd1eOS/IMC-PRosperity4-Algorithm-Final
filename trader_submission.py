@@ -96,10 +96,11 @@ CONFIG = {
     "velvet_alpha_gate": 1.5,
     "velvet_alpha_cap": 10,
     "enable_velvet_alpha": False,
-    "hydrogel_normal_cap": 30,
-    "hydrogel_profit_lock_cap": 20,
-    "hydrogel_tight_cap": 10,
+    "hydrogel_normal_cap": 10,
+    "hydrogel_profit_lock_cap": 10,
+    "hydrogel_tight_cap": 5,
     "hydrogel_aggressive_take": False,
+    "hydrogel_min_spread": 14,
     "pre_choice_caps": {
         "VEV_4000": 0,
         "VEV_4500": 0,
@@ -109,8 +110,8 @@ CONFIG = {
         "VEV_5300": 0,
         "VEV_5400": 0,
         "VEV_5500": 0,
-        "VEV_6000": 300,
-        "VEV_6500": 300,
+        "VEV_6000": 100,
+        "VEV_6500": 100,
     },
     "pre_choice_max_ask": {
         "VEV_5300": None,
@@ -126,12 +127,16 @@ CONFIG = {
         "VELVETFRUIT_EXTRACT": 10,
         "HYDROGEL_PACK": 5,
     },
+    "vev_lottery_base_cap": 100,
+    "vev_lottery_confirmed_cap": 300,
+    "vev_lottery_base_budget": 200,
+    "vev_lottery_confirmed_budget": 600,
     "portfolio_profit_lock": 500.0,
     "portfolio_tight_lock": 800.0,
     "portfolio_drawdown_limit": 400.0,
-    "hydro_drawdown_limit": 250.0,
-    "endgame_ts": 850000,
-    "final_flat_ts": 950000,
+    "hydro_drawdown_limit": 150.0,
+    "endgame_ts": 85000,
+    "final_flat_ts": 95000,
     "enable_postchoice_delta_hedge": False,
 
     # ── Version flag ──────────────────────────────────────────────────────
@@ -236,6 +241,9 @@ class State:
         "peak_pnl",       # portfolio peak pnl proxy
         "hydro_peak_pnl", # HYDROGEL-specific peak pnl proxy
         "mode",           # NORMAL / PROFIT_LOCK / RISK_OFF / ENDGAME_FLAT
+        "vev_confirmed",  # bool: lottery confirmation signal received
+        "vev_bid_ticks",  # int: consecutive ticks best_bid >= 1 for VEV_6000/6500
+        "hydro_disabled", # bool: HYDROGEL shut off due to drawdown
         "ts",             # last timestamp
     ]
 
@@ -257,6 +265,9 @@ class State:
         self.peak_pnl = 0.0
         self.hydro_peak_pnl = 0.0
         self.mode = "NORMAL"
+        self.vev_confirmed = False
+        self.vev_bid_ticks = 0
+        self.hydro_disabled = False
         self.ts           = 0
 
     def to_json(self):
@@ -278,6 +289,9 @@ class State:
             "pp": round(self.peak_pnl, 2),
             "hp": round(self.hydro_peak_pnl, 2),
             "md": self.mode,
+            "vc": int(self.vev_confirmed),
+            "vb": self.vev_bid_ticks,
+            "hd": int(self.hydro_disabled),
             "ts": self.ts,
         }, separators=(',', ':'))
 
@@ -305,6 +319,9 @@ class State:
             obj.peak_pnl = d.get("pp", 0.0)
             obj.hydro_peak_pnl = d.get("hp", 0.0)
             obj.mode = d.get("md", "NORMAL")
+            obj.vev_confirmed = bool(d.get("vc", 0))
+            obj.vev_bid_ticks = int(d.get("vb", 0))
+            obj.hydro_disabled = bool(d.get("hd", 0))
             obj.ts           = d.get("ts", 0)
         except Exception:
             pass  # corrupt state -> fresh start
@@ -463,7 +480,9 @@ class Trader:
             return "PROFIT_LOCK"
         return "NORMAL"
 
-    def _hydrogel_cap(self, ts, pos, risk, mode, cfg):
+    def _hydrogel_cap(self, ts, pos, risk, mode, cfg, S=None):
+        if S is not None and S.hydro_disabled:
+            return 0
         cap = cfg["hydrogel_normal_cap"]
         if risk["portfolio_pnl"] > cfg["portfolio_profit_lock"]:
             cap = min(cap, cfg["hydrogel_profit_lock_cap"])
@@ -474,7 +493,7 @@ class Trader:
         if ts > cfg["final_flat_ts"]:
             cap = 0
         if risk["hydro_drawdown"] > cfg["hydro_drawdown_limit"]:
-            cap = min(cap, cfg["hydrogel_tight_cap"])
+            cap = 0
         if mode == "RISK_OFF":
             cap = min(cap, abs(pos))
         return max(0, int(cap))
@@ -490,17 +509,23 @@ class Trader:
             return cfg.get("velvet_stable_cap", 0)
         return cfg.get("velvet_alpha_cap", 10)
 
-    def _symbol_cap(self, sym, phase, cfg, limits):
+    def _symbol_cap(self, sym, phase, cfg, limits, S=None, pos=None):
         cap = limits.get(sym, 300)
         if phase == "PRE_CHOICE" and sym.startswith("VEV_"):
-            cap = min(cap, cfg.get("pre_choice_caps", {}).get(sym, 0))
+            base_cap = cfg.get("pre_choice_caps", {}).get(sym, 0)
+            # For VEV_6000/6500: upgrade to confirmed cap if confirmation signal received
+            if sym in ("VEV_6000", "VEV_6500") and S is not None and S.vev_confirmed:
+                confirmed_cap = cfg.get("vev_lottery_confirmed_cap", 300)
+                cap = min(cap, confirmed_cap)
+            else:
+                cap = min(cap, base_cap)
         return max(0, int(cap))
 
-    def _safe_add_order(self, orders_out, sym, price, qty, state_pos, sent_qty, phase, cfg, limits):
+    def _safe_add_order(self, orders_out, sym, price, qty, state_pos, sent_qty, phase, cfg, limits, S=None):
         if qty == 0:
             return 0
 
-        cap = self._symbol_cap(sym, phase, cfg, limits)
+        cap = self._symbol_cap(sym, phase, cfg, limits, S=S)
         cur = state_pos.get(sym, 0)
 
         if qty > 0:
@@ -596,7 +621,7 @@ class Trader:
         risk = self._compute_risk_snapshot(S, pos, depths)
         mode = self._risk_mode(ts, risk, cfg)
         S.mode = mode
-        hydro_cap = self._hydrogel_cap(ts, pos.get("HYDROGEL_PACK", 0), risk, mode, cfg)
+        hydro_cap = self._hydrogel_cap(ts, pos.get("HYDROGEL_PACK", 0), risk, mode, cfg, S=S)
         velvet_cap = self._velvet_cap(ts, alpha_signal, mode, cfg)
 
         logs.append(f"ts={ts} ph={phase[:3]} md={mode[:4]} p={risk['portfolio_pnl']:.0f}")
@@ -612,7 +637,7 @@ class Trader:
             self._trade_hydrogel(
                 depths["HYDROGEL_PACK"], hydro_fv,
                 state_pos.get("HYDROGEL_PACK", 0), limits, orders_out, cfg,
-                phase, state_pos, sent_qty, risk, mode, hydro_cap
+                phase, state_pos, sent_qty, risk, mode, hydro_cap, S=S
             )
 
         # ── 3. VELVETFRUIT_EXTRACT ────────────────────────────────────────
@@ -625,6 +650,7 @@ class Trader:
             )
 
         # ── 4 & 5. VEV strikes ────────────────────────────────────────────
+        self._vev_update_confirmation(S, depths, mtrades, cfg)
         ordered = STRIKE_ORDER.get(phase, STRIKE_ORDER["PRE_CHOICE"])
         S = self._trade_vev_all(
             ordered, depths, mtrades, state_pos, velvet_fv,
@@ -722,70 +748,55 @@ class Trader:
 
     # ── HYDROGEL trading ──────────────────────────────────────────────────────
 
-    def _trade_hydrogel(self, od, fv, pos, limits, orders_out, cfg, phase, state_pos, sent_qty, risk, mode, hydro_cap):
+    def _trade_hydrogel(self, od, fv, pos, limits, orders_out, cfg, phase, state_pos, sent_qty, risk, mode, hydro_cap, S=None):
         bids, asks = _get_book(od)
-        hs = cfg["hydrogel_half_spread"]
-        lim = max(1, hydro_cap)
-        pos_frac = pos / lim
-        skew = -pos_frac * hs
+        best_bid = bids[0][0] if bids else None
+        best_ask = asks[0][0] if asks else None
+
+        # Permanently disable if drawdown exceeded limit
+        if S is not None and risk["hydro_drawdown"] > cfg["hydro_drawdown_limit"]:
+            S.hydro_disabled = True
+        if S is not None and S.hydro_disabled and pos == 0:
+            return  # only allow liquidation if disabled
 
         if mode == "ENDGAME_FLAT":
             if pos > 0 and bids:
-                best_bid, best_bv = bids[0]
-                self._safe_add_order(orders_out, "HYDROGEL_PACK", best_bid, -min(best_bv, pos), state_pos, sent_qty, phase, cfg, {**limits, "HYDROGEL_PACK": hydro_cap})
+                best_bid2, best_bv = bids[0]
+                self._safe_add_order(orders_out, "HYDROGEL_PACK", best_bid2, -min(best_bv, pos), state_pos, sent_qty, phase, cfg, {**limits, "HYDROGEL_PACK": hydro_cap})
             elif pos < 0 and asks:
-                best_ask, best_av = asks[0]
-                self._safe_add_order(orders_out, "HYDROGEL_PACK", best_ask, min(best_av, abs(pos)), state_pos, sent_qty, phase, cfg, {**limits, "HYDROGEL_PACK": hydro_cap})
+                best_ask2, best_av = asks[0]
+                self._safe_add_order(orders_out, "HYDROGEL_PACK", best_ask2, min(best_av, abs(pos)), state_pos, sent_qty, phase, cfg, {**limits, "HYDROGEL_PACK": hydro_cap})
             return
 
         if mode == "RISK_OFF":
             if pos > 0 and bids:
-                best_bid, best_bv = bids[0]
-                self._safe_add_order(orders_out, "HYDROGEL_PACK", best_bid, -min(best_bv, max(1, pos)), state_pos, sent_qty, phase, cfg, {**limits, "HYDROGEL_PACK": hydro_cap})
+                best_bid2, best_bv = bids[0]
+                self._safe_add_order(orders_out, "HYDROGEL_PACK", best_bid2, -min(best_bv, max(1, pos)), state_pos, sent_qty, phase, cfg, {**limits, "HYDROGEL_PACK": hydro_cap})
             elif pos < 0 and asks:
-                best_ask, best_av = asks[0]
-                self._safe_add_order(orders_out, "HYDROGEL_PACK", best_ask, min(best_av, max(1, abs(pos))), state_pos, sent_qty, phase, cfg, {**limits, "HYDROGEL_PACK": hydro_cap})
+                best_ask2, best_av = asks[0]
+                self._safe_add_order(orders_out, "HYDROGEL_PACK", best_ask2, min(best_av, max(1, abs(pos))), state_pos, sent_qty, phase, cfg, {**limits, "HYDROGEL_PACK": hydro_cap})
             return
 
-        # Passive quotes
-        bid_q = round(fv - hs + skew)
-        ask_q = round(fv + hs + skew)
-        best_bid = bids[0][0] if bids else None
-        best_ask = asks[0][0] if asks else None
-        if best_bid is not None and bid_q > best_bid:
-            bid_q = best_bid
-        if best_ask is not None and ask_q < best_ask:
-            ask_q = best_ask
-        if best_ask is not None and bid_q >= best_ask:
-            bid_q = best_ask - 1
-        if best_bid is not None and ask_q <= best_bid:
-            ask_q = best_bid + 1
+        if hydro_cap <= 0:
+            return
+
+        # Spread gate: only quote if spread >= hydrogel_min_spread
+        if best_bid is None or best_ask is None:
+            return
+        spread = best_ask - best_bid
+        if spread < cfg.get("hydrogel_min_spread", 14):
+            return
+
+        # Quote strictly at best_bid / best_ask (no FV bias)
         local_limits = {**limits, "HYDROGEL_PACK": hydro_cap}
-        bid_sz = _clip(max(0, min(10, hydro_cap - pos)), "HYDROGEL_PACK", {"HYDROGEL_PACK": pos}, local_limits)
-        ask_sz = _clip(-max(0, min(10, hydro_cap + pos)), "HYDROGEL_PACK", {"HYDROGEL_PACK": pos}, local_limits)
+        quote_size = min(5, hydro_cap)
+        bid_sz = _clip(max(0, min(quote_size, hydro_cap - pos)), "HYDROGEL_PACK", {"HYDROGEL_PACK": pos}, local_limits)
+        ask_sz = _clip(-max(0, min(quote_size, hydro_cap + pos)), "HYDROGEL_PACK", {"HYDROGEL_PACK": pos}, local_limits)
 
         if bid_sz > 0:
-            self._safe_add_order(orders_out, "HYDROGEL_PACK", bid_q, bid_sz, state_pos, sent_qty, phase, cfg, local_limits)
+            self._safe_add_order(orders_out, "HYDROGEL_PACK", best_bid, bid_sz, state_pos, sent_qty, phase, cfg, local_limits)
         if ask_sz < 0:
-            self._safe_add_order(orders_out, "HYDROGEL_PACK", ask_q, ask_sz, state_pos, sent_qty, phase, cfg, local_limits)
-
-        if not cfg.get("hydrogel_aggressive_take", False):
-            return
-
-        # Aggressive take: only for big mispricings (2x spread)
-        take_edge = cfg["take_edge_min"] * 2
-        if asks:
-            best_ask, best_av = asks[0]
-            if best_ask < fv - take_edge:
-                qty = _clip(best_av, "HYDROGEL_PACK", {"HYDROGEL_PACK": pos}, local_limits)
-                if qty > 0:
-                    self._safe_add_order(orders_out, "HYDROGEL_PACK", best_ask, qty, state_pos, sent_qty, phase, cfg, local_limits)
-        if bids:
-            best_bid, best_bv = bids[0]
-            if best_bid > fv + take_edge:
-                qty = _clip(-best_bv, "HYDROGEL_PACK", {"HYDROGEL_PACK": pos}, local_limits)
-                if qty < 0:
-                    self._safe_add_order(orders_out, "HYDROGEL_PACK", best_bid, qty, state_pos, sent_qty, phase, cfg, local_limits)
+            self._safe_add_order(orders_out, "HYDROGEL_PACK", best_ask, ask_sz, state_pos, sent_qty, phase, cfg, local_limits)
 
     # ── VELVET trading ────────────────────────────────────────────────────────
 
@@ -830,6 +841,53 @@ class Trader:
                 qty = _clip(-min(bv, 10), "VELVETFRUIT_EXTRACT", p_sym, local_limits)
                 if qty < 0:
                     self._safe_add_order(orders_out, "VELVETFRUIT_EXTRACT", bp, qty, state_pos, sent_qty, phase, cfg, local_limits)
+
+    # ── VEV confirmation signal ───────────────────────────────────────────────
+
+    def _vev_update_confirmation(self, S, depths, mtrades, cfg):
+        """Update S.vev_confirmed based on confirmation signals for VEV_6000/6500."""
+        confirmed = S.vev_confirmed
+        bid_tick = False
+        for sym in ("VEV_6000", "VEV_6500"):
+            od = depths.get(sym)
+            if od is None:
+                continue
+            bids, asks = _get_book(od)
+            best_bid = bids[0][0] if bids else None
+            best_ask = asks[0][0] if asks else None
+            mid = None
+            if best_bid is not None and best_ask is not None:
+                mid = (best_bid + best_ask) / 2.0
+            elif best_bid is not None:
+                mid = float(best_bid)
+            # Signal 1: bid >= 1
+            if best_bid is not None and best_bid >= 1:
+                bid_tick = True
+            # Signal 2: mid >= 1.5
+            if mid is not None and mid >= 1.5:
+                confirmed = True
+            # Signal 3: Mark 01 is buyer (not seller) in market trades
+            for t in mtrades.get(sym, []):
+                tp = t.price if hasattr(t, "price") else t.get("price", 0)
+                buyer = (t.buyer if hasattr(t, "buyer") else t.get("buyer", "")) or ""
+                seller = (t.seller if hasattr(t, "seller") else t.get("seller", "")) or ""
+                if tp >= 2:
+                    confirmed = True
+                elif "Mark_01" in buyer or "Olivia" in buyer:
+                    confirmed = True
+                elif "Mark_01" in seller or "Olivia" in seller:
+                    # Mark 01 selling -> reduce confidence
+                    confirmed = False
+
+        if bid_tick:
+            S.vev_bid_ticks += 1
+        else:
+            S.vev_bid_ticks = 0
+        # Signal 4: bid >= 1 for multiple consecutive ticks
+        if S.vev_bid_ticks >= 3:
+            confirmed = True
+
+        S.vev_confirmed = confirmed
 
     # ── VEV trading (all strikes) ─────────────────────────────────────────────
 
@@ -882,6 +940,16 @@ class Trader:
                 mode in ("RISK_OFF", "ENDGAME_FLAT") and sym not in ("VEV_6000", "VEV_6500")
             )
             allowed_in_endgame = ts <= cfg["final_flat_ts"]
+
+            # Lottery budget gate for VEV_6000/6500
+            lottery_ok = True
+            if sym in ("VEV_6000", "VEV_6500") and phase == "PRE_CHOICE":
+                total_lottery = pos.get("VEV_6000", 0) + pos.get("VEV_6500", 0)
+                budget = (cfg.get("vev_lottery_confirmed_budget", 600) if S.vev_confirmed
+                          else cfg.get("vev_lottery_base_budget", 200))
+                if total_lottery >= budget:
+                    lottery_ok = False
+
             allow_pre_choice_buy = (
                 phase == "PRE_CHOICE"
                 and best_ask is not None
@@ -891,6 +959,7 @@ class Trader:
                 and allowed_in_risk_mode
                 and (ts <= cfg["endgame_ts"] or sym in ("VEV_6000", "VEV_6500"))
                 and allowed_in_endgame
+                and lottery_ok
             )
 
             if mode in ("RISK_OFF", "ENDGAME_FLAT") and sym == "VEV_5500":
@@ -904,7 +973,7 @@ class Trader:
                     av = asks[0][1] if asks else 0
                     qty = _clip(min(av, limits.get(sym, 300)), sym, p_sym, limits)
                     if qty > 0:
-                        filled = self._safe_add_order(orders_out, sym, best_ask, qty, pos, sent_qty, phase, cfg, limits)
+                        filled = self._safe_add_order(orders_out, sym, best_ask, qty, pos, sent_qty, phase, cfg, limits, S=S)
                         if filled > 0:
                             logs.append(f"FLOOR_TAKE {sym} a={best_ask} floor={ch_floor:.0f}")
                             p_sym[sym] = p_sym.get(sym, cur_pos) + filled
@@ -917,7 +986,7 @@ class Trader:
                     av = asks[0][1] if asks else 0
                     qty = _clip(min(av, 15), sym, p_sym, limits)
                     if qty > 0:
-                        filled = self._safe_add_order(orders_out, sym, best_ask, qty, pos, sent_qty, phase, cfg, limits)
+                        filled = self._safe_add_order(orders_out, sym, best_ask, qty, pos, sent_qty, phase, cfg, limits, S=S)
                         if filled > 0:
                             p_sym[sym] = p_sym.get(sym, cur_pos) + filled
                             cur_pos += filled
@@ -927,7 +996,7 @@ class Trader:
                     bv = bids[0][1] if bids else 0
                     qty = _clip(-min(bv, 15), sym, p_sym, limits)
                     if qty < 0:
-                        filled = self._safe_add_order(orders_out, sym, best_bid, qty, pos, sent_qty, phase, cfg, limits)
+                        filled = self._safe_add_order(orders_out, sym, best_bid, qty, pos, sent_qty, phase, cfg, limits, S=S)
                         if filled < 0:
                             p_sym[sym] = p_sym.get(sym, cur_pos) + filled
                             cur_pos += filled
