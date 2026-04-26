@@ -207,3 +207,24 @@ Strategy: │   ACCUMULATE     │      REDUCE         │    DEFEND      │
 | v1.5 | 2026-04-25 | 失败（PnL=−559，log 376046） | 框架重写：VRP 信号 + 趋势抑制。致命 bug：RV_ann=0.422 >> ATM_IV=0.276 恒为负 → 永远 BUY vega → 期权净亏 −1821；趋势检测封锁 HYDROGEL 做市超过 8900 ts，HYD 降至 +374 |
 | v1.6 | 2026-04-25 | 已部署（PnL=+533，log 377206） | 期权全局禁用（ENABLE_OPTIONS=False）；移除趋势检测；新增主动平仓层（UNWIND_THRESHOLD=20，UNWIND_LOT=10）；Unwind 数学缺陷：qty 公式含距离上限且未抑制 Maker ask，导致实际零效果 |
 | v1.7 | 2026-04-25 | 待云端验证 | UNWIND_THRESHOLD=15，UNWIND_LOT=15（均衡修正）；新增 in_short/long_emergency flag；紧急态禁止同侧 Maker 报价，阻止 Unwind 被 Maker 抵消；预期 PnL +900～+1300 |
+
+---
+
+## 6. v3.0 Architecture Shift (Approved Plan B)
+
+v2.9 solved the 50k-65k flat-trap and raised PnL to 1437, but two structural pressures remained:
+- Early wrong-side carry (25.8k-32.7k drawdown)
+- Mid/late over-cover leakage (49k and 76.8k-91k)
+
+v3.0 introduces a dual-state control model:
+- Price-zone state: HIGH/MID/LOW (market microstructure view)
+- Inventory-risk state: NORMAL / DERISK / CAPTURE_LOCK (inventory lifecycle view)
+
+Core idea:
+- Separate "when market is in a zone" from "whether current inventory is healthy".
+- All buy-side reduction goes through a single target controller to avoid conflicting local heuristics.
+
+Expected benefit direction:
+- Reduce early adverse carry duration
+- Remove branch-overlap over-cover events
+- Preserve late reload downswing participation

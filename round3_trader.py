@@ -112,6 +112,16 @@ HYD_PHASE_C_SHORT_CAP    = -20     # Phase C: very tight cap at -20 for rapid ex
 HYD_PHASE_B_REDUCE_START = 50000   # Within Phase B, start aggressive reduction at 50k
 HYD_PHASE_B_REDUCE_TARGET= -25     # Phase B reduction target: buy back to -25 max
 HYD_PHASE_B_REDUCE_LOT   = 6       # Lot size per reduction taker buy in Phase B
+HYD_TARGET_SHORT_A       = -18     # unified target controller: early-stage short target
+HYD_TARGET_SHORT_B       = -25     # unified target controller: mid-stage short target
+HYD_TARGET_SHORT_C       = -12     # unified target controller: late-stage short target
+HYD_DERISK_TARGET_SHORT  = -6      # de-risk mode: reduce short carry quickly
+HYD_DERISK_LOT           = 8
+HYD_ADVERSE_STEP         = 8.0     # adverse rally detector in microprice points
+HYD_ADVERSE_STREAK_TRIG  = 2       # consecutive adverse ticks to enter de-risk
+HYD_DERISK_HOLD_TICKS    = 6000
+HYD_CAPTURE_HOLD_TICKS   = 5000    # lock cover after reload to preserve downswing capture
+HYD_CAPTURE_MIN_SHORT    = -14     # during capture lock, do not cover beyond this short
 
 # Logger / state
 MAX_LOG_LEN       = 3750
@@ -459,14 +469,17 @@ def voucher_and_hedge_orders(
 # ================================================================
 # Module B: HYDROGEL market maker (clean-slate, no R1/R2 heritage)
 # ================================================================
-def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
+def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger, hyd_ctrl):
+    if not isinstance(hyd_ctrl, dict):
+        hyd_ctrl = {}
+
     bb, ba = best_bid_ask(od)
     if bb is None or ba is None:
-        return []
+        return [], hyd_ctrl
 
     mp = microprice(od)
     if mp is None:
-        return []
+        return [], hyd_ctrl
 
     raw_spread = ba - bb
     spread_hist.append(raw_spread)
@@ -488,6 +501,11 @@ def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
     orders = []
     sim_pos = pos
 
+    prev_mp = hyd_ctrl.get("prev_mp")
+    adverse_up_streak = int(hyd_ctrl.get("adverse_up_streak", 0))
+    derisk_until = int(hyd_ctrl.get("derisk_until", 0))
+    capture_until = int(hyd_ctrl.get("capture_until", 0))
+
     # ===== PHASE DETECTION (v2.9) =====
     if timestamp < HYD_PHASE_A_THRESH:
         phase = "A"
@@ -506,41 +524,79 @@ def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
     low_unwind_thresh = LOW_UNWIND_THRESH_EARLY if timestamp < LOW_UNWIND_SWITCH_TS else LOW_UNWIND_THRESH_LATE
     late_mid_cover = timestamp >= HIGH_LATE_TAKER_SELL_START_TS
 
-    # ===== PHASE B AGGRESSIVELY REDUCE SHORT (v2.9) =====
-    # In Phase B (40k-70k), after first round of accumulation, aggressively unwind shorts.
-    # This prevents the "flat trap" where position sits wrong for 15k seconds.
-    if phase == "B" and timestamp >= HYD_PHASE_B_REDUCE_START and pos <= HYD_PHASE_B_REDUCE_TARGET and not hard_long:
-        if ba is not None:
-            room = HYD_LIMIT - sim_pos
-            ba_liq = abs(od.sell_orders.get(ba, 0))
-            reduce_need = max(0, HYD_PHASE_B_REDUCE_TARGET - sim_pos)
-            qty = min(HYD_PHASE_B_REDUCE_LOT, ba_liq, room, reduce_need)
-            if qty > 0:
-                orders.append(Order(SYM_HYD, ba, qty))
-                sim_pos += qty
-                logger.log("HYD PHASE_B REDUCE " + str(qty) + "@" + str(ba))
+    # ===== Inventory risk state =====
+    if prev_mp is not None and pos < 0:
+        if (mp - float(prev_mp)) >= HYD_ADVERSE_STEP:
+            adverse_up_streak += 1
+        else:
+            adverse_up_streak = max(0, adverse_up_streak - 1)
+    else:
+        adverse_up_streak = max(0, adverse_up_streak - 1)
 
-    # MID zone forced taker buy: when in MID zone and carrying significant short,
-    # aggressively buy back to compress position and reduce upswing drawdown.
+    if adverse_up_streak >= HYD_ADVERSE_STREAK_TRIG:
+        derisk_until = max(derisk_until, timestamp + HYD_DERISK_HOLD_TICKS)
+    derisk_active = timestamp < derisk_until
+    capture_active = timestamp < capture_until
+
+    if phase == "A":
+        target_short = HYD_TARGET_SHORT_A
+    elif phase == "B":
+        target_short = HYD_TARGET_SHORT_B
+    else:
+        target_short = HYD_TARGET_SHORT_C
+
+    # If inventory turns wrong-way in an adverse rally, reduce short carry quickly.
+    if derisk_active:
+        target_short = max(target_short, HYD_DERISK_TARGET_SHORT)
+
+    # Capture lock prevents over-covering immediately after reload.
+    effective_cover_target = target_short
+    if capture_active:
+        effective_cover_target = min(effective_cover_target, HYD_CAPTURE_MIN_SHORT)
+
+    # ===== Unified buy-side target controller =====
+    buy_lot_cap = 0
+    buy_reasons = []
+
     if zone == "MID" and pos <= MID_TAKER_FORCED_BUY_THRESH and not hard_long:
-        if ba is not None:
-            room = HYD_LIMIT - sim_pos
-            # IMC sell-side depth is negative in many books; use absolute available size.
-            ba_liq = abs(od.sell_orders.get(ba, 0))
-            if late_mid_cover:
-                trim_need = max(0, MID_TAKER_LATE_BUY_TARGET - sim_pos)
-                qty = min(MID_TAKER_LATE_BUY_LOT, ba_liq, room, trim_need)
-            else:
-                qty = min(MID_TAKER_FORCED_BUY_LOT, ba_liq, room)
-            if qty > 0:
-                orders.append(Order(SYM_HYD, ba, qty))
-                sim_pos += qty
-                logger.log("HYD MID TAKER BUY " + str(qty) + "@" + str(ba))
+        if late_mid_cover:
+            buy_lot_cap = max(buy_lot_cap, MID_TAKER_LATE_BUY_LOT)
+            buy_reasons.append("MID_LATE")
+        else:
+            buy_lot_cap = max(buy_lot_cap, MID_TAKER_FORCED_BUY_LOT)
+            buy_reasons.append("MID")
+
+    if phase == "B" and timestamp >= HYD_PHASE_B_REDUCE_START and pos <= HYD_PHASE_B_REDUCE_TARGET and not hard_long:
+        buy_lot_cap = max(buy_lot_cap, HYD_PHASE_B_REDUCE_LOT)
+        buy_reasons.append("PHASE_B")
+
+    if zone == "LOW" and pos < -low_unwind_thresh and not hard_long and not capture_active:
+        buy_lot_cap = max(buy_lot_cap, LOW_UNWIND_LOT)
+        buy_reasons.append("LOW")
+
+    if derisk_active and pos < HYD_DERISK_TARGET_SHORT and not hard_long:
+        buy_lot_cap = max(buy_lot_cap, HYD_DERISK_LOT)
+        buy_reasons.append("DERISK")
+
+    if buy_lot_cap > 0 and ba is not None:
+        room = HYD_LIMIT - sim_pos
+        ba_liq = abs(od.sell_orders.get(ba, 0))
+        target_need = max(0, effective_cover_target - sim_pos)
+        qty = min(buy_lot_cap, ba_liq, room, target_need)
+        if qty > 0:
+            orders.append(Order(SYM_HYD, ba, qty))
+            sim_pos += qty
+            logger.log(
+                "HYD TARGET BUY " + str(qty) + "@" + str(ba) +
+                " rs=" + "/".join(buy_reasons) +
+                " tgt=" + str(effective_cover_target)
+            )
 
     # Taker phase: aggress when book is mispriced relative to microprice
     if not hard_long and ba < mp - edge - HYD_TAKER_PAD:
         room = HYD_LIMIT - sim_pos
-        qty = min(abs(od.sell_orders[ba]), room, HYD_LOT)
+        target_need = max(0, effective_cover_target - sim_pos)
+        qty = min(abs(od.sell_orders[ba]), room, HYD_LOT, target_need)
         if qty > 0:
             orders.append(Order(SYM_HYD, ba, qty))
             sim_pos += qty
@@ -564,15 +620,8 @@ def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
         if qty > 0:
             orders.append(Order(SYM_HYD, bb, -qty))
             sim_pos -= qty
+            capture_until = max(capture_until, timestamp + HYD_CAPTURE_HOLD_TICKS)
             logger.log("HYD HIGH RELOAD SELL " + str(qty) + "@" + str(bb))
-
-    # Zone taker unwind: in LOW zone, if still carrying a short, cross spread to reduce.
-    if zone == "LOW" and pos < -low_unwind_thresh and not hard_long:
-        qty = min(LOW_UNWIND_LOT, HYD_LIMIT - sim_pos, (-pos) - low_unwind_thresh)
-        if qty > 0:
-            orders.append(Order(SYM_HYD, ba, qty))
-            sim_pos += qty
-            logger.log("HYD ZONE UNWIND " + str(qty) + "@" + str(ba))
 
     # Zone-controlled maker: HIGH = ask only (build short); LOW = bid only (close short); MID = both
     # Added: HIGH zone absolute short cap (time-adaptive); MID zone sell prohibition
@@ -580,19 +629,29 @@ def hydrogel_orders(od, pos, spread_hist, zone, timestamp, logger):
         buy_room = 0
         # Strict cap sizing: never post more ask size than remaining room to hard cap.
         room_to_cap = max(0, sim_pos - active_short_cap)
-        sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT, room_to_cap)
+        if derisk_active:
+            sell_room = 0
+        else:
+            sell_room = 0 if hard_short else min(HYD_LIMIT + sim_pos, HYD_LOT, room_to_cap)
     elif zone == "LOW":
-        buy_room  = 0 if hard_long else min(HYD_LIMIT - sim_pos, HYD_LOT)
+        maker_need = max(0, effective_cover_target - sim_pos)
+        buy_room  = 0 if hard_long else min(HYD_LIMIT - sim_pos, HYD_LOT, maker_need)
         sell_room = 0
     else:  # MID
-        buy_room  = 0 if hard_long else min(HYD_LIMIT - sim_pos, HYD_LOT)
+        maker_need = max(0, effective_cover_target - sim_pos)
+        buy_room  = 0 if hard_long else min(HYD_LIMIT - sim_pos, HYD_LOT, maker_need)
         sell_room = 0  # force sell_room=0 in MID to block counter-productive short extension
     if buy_room > 0:
         orders.append(Order(SYM_HYD, bid_px, buy_room))
     if sell_room > 0:
         orders.append(Order(SYM_HYD, ask_px, -sell_room))
 
-    return orders
+    hyd_ctrl["prev_mp"] = mp
+    hyd_ctrl["adverse_up_streak"] = adverse_up_streak
+    hyd_ctrl["derisk_until"] = derisk_until
+    hyd_ctrl["capture_until"] = capture_until
+
+    return orders, hyd_ctrl
 
 
 # ================================================================
@@ -614,6 +673,9 @@ class Trader:
             vrp_state = {}
         hyd_spread_hist = list(mem.get("hyd_spread", []))
         hyd_zone        = mem.get("hyd_zone", "MID")
+        hyd_ctrl        = mem.get("hyd_ctrl", {})
+        if not isinstance(hyd_ctrl, dict):
+            hyd_ctrl = {}
 
         # -- Module A: vouchers + underlying delta hedge --
         try:
@@ -654,7 +716,9 @@ class Trader:
                             hyd_zone = "HIGH"
                         elif cur_mid < ZONE_LOW_ENTER:
                             hyd_zone = "LOW"
-                b_orders = hydrogel_orders(od_hyd, pos_hyd, hyd_spread_hist, hyd_zone, state.timestamp, logger)
+                b_orders, hyd_ctrl = hydrogel_orders(
+                    od_hyd, pos_hyd, hyd_spread_hist, hyd_zone, state.timestamp, logger, hyd_ctrl
+                )
                 if b_orders:
                     result.setdefault(SYM_HYD, []).extend(b_orders)
         except Exception as e:
@@ -689,11 +753,20 @@ class Trader:
         mem["vrp"]       = vrp_state
         mem["hyd_spread"] = hyd_spread_hist[-HYD_SPREAD_WINDOW:]
         mem["hyd_zone"]   = hyd_zone
+        mem["hyd_ctrl"]   = hyd_ctrl
         td = json.dumps(mem, separators=(",", ":"))
         if len(td) > MAX_TRADER_DATA:
             if "rv_hist" in mem.get("vrp", {}):
                 mem["vrp"]["rv_hist"] = mem["vrp"]["rv_hist"][-20:]
             mem["hyd_spread"] = mem["hyd_spread"][-10:]
+            # keep only small scalar fields in HYD control state
+            if "hyd_ctrl" in mem and isinstance(mem["hyd_ctrl"], dict):
+                mem["hyd_ctrl"] = {
+                    "prev_mp": mem["hyd_ctrl"].get("prev_mp"),
+                    "adverse_up_streak": mem["hyd_ctrl"].get("adverse_up_streak", 0),
+                    "derisk_until": mem["hyd_ctrl"].get("derisk_until", 0),
+                    "capture_until": mem["hyd_ctrl"].get("capture_until", 0),
+                }
             td = json.dumps(mem, separators=(",", ":"))
             logger.log("[TRIM] td=" + str(len(td)))
 

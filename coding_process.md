@@ -1241,3 +1241,49 @@ LOW_UNWIND_THRESH = 10 / LOW_UNWIND_LOT = 10
 - 检查 init_up 是否出现异常 PnL 跌落（若有：HIGH 区期间 ask 仍有 taker mispricing 保护）
 - 观察 dn1/dn2 期间 PnL 曲线斜率（应明显正值）
 
+
+---
+
+## Entry 016 �� v3.0 �� HYD Inventory-State Refactor (Plan B Executed)
+
+- Version: v3.0
+- Date: 2026-04-26
+- Baseline: v2.9 cloud run 420388, PnL=1437
+- Trigger: User-approved workflow plan to solve early/mid downside pressure via architecture refactor
+
+### What Was Refactored (No Parameter-Tuning Iteration)
+
+1) Unified buy-side target controller in `hydrogel_orders()`
+- Replaced split logic (`PHASE_B REDUCE` + `MID TAKER BUY` + `LOW UNWIND`) with one target-based cover path.
+- New log: `HYD TARGET BUY qty@price rs=... tgt=...`
+- Effect: prevent multi-branch over-covering and enforce monotonic movement toward target short.
+
+2) Inventory risk state layer (independent from HIGH/MID/LOW zone)
+- Added adverse rally detector based on microprice (`HYD_ADVERSE_STEP`, `HYD_ADVERSE_STREAK_TRIG`).
+- Added de-risk hold window (`HYD_DERISK_HOLD_TICKS`) and de-risk target short (`HYD_DERISK_TARGET_SHORT`).
+- Effect: handle early wrong-side inventory pressure without waiting for zone transition.
+
+3) Capture latch after late reload
+- On `HYD HIGH RELOAD SELL`, activate cover lock for `HYD_CAPTURE_HOLD_TICKS`.
+- During lock, cover target is floored by `HYD_CAPTURE_MIN_SHORT`.
+- Effect: keep downswing participation after successful late reload and prevent immediate give-back.
+
+4) Maker policy integration
+- During de-risk, HIGH-zone sell maker is disabled (no new short extension).
+- LOW/MID maker bid size is capped by target short need.
+
+5) Stateful persistence
+- Added `hyd_ctrl` memory in traderData: `prev_mp`, `adverse_up_streak`, `derisk_until`, `capture_until`.
+- Added trim-safe serialization for `hyd_ctrl` scalars.
+
+### Files Modified
+- `round3_trader.py`
+
+### Local Validation
+- `python -c "import ast; ast.parse(open('round3_trader.py', encoding='utf-8').read()); import round3_trader; round3_trader.Trader()"` => Pass
+
+### Next Step
+- Upload v3.0 to cloud sandbox and validate zone-level behavior:
+  - 25.8k-32.7k drawdown compression
+  - 49k over-cover elimination
+  - 76.8k-91k downswing capture retention

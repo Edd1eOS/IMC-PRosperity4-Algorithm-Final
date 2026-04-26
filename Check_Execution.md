@@ -241,3 +241,34 @@
 - [x] 常量与 P4 Wiki 原文一致
 - [ ] 用户将 `round3_trader.py` 上传至 IMC 沙盒
 - [ ] 用户反馈 log 路径 + PnL 数据 + 资金曲线截图
+
+---
+
+## Entry 003 �� v3.0 �� Inventory-State Refactor Self Check
+
+- Date: 2026-04-26
+- Scope: `round3_trader.py` HYD module only
+
+### Syntax / Import
+- [x] AST parse pass
+- [x] Module import pass (`round3_trader.Trader()`)
+
+### Structural Checks
+- [x] `hydrogel_orders` signature updated to include `hyd_ctrl`
+- [x] Early exits return tuple `(orders, hyd_ctrl)` consistently
+- [x] Unified buy-side controller present (`HYD TARGET BUY` log path)
+- [x] Legacy split cover path removed (no standalone LOW unwind block)
+- [x] Capture latch update on `HYD HIGH RELOAD SELL`
+- [x] De-risk state based on adverse rally streak
+- [x] HIGH-zone maker short extension disabled under de-risk
+- [x] LOW/MID maker buys bounded by target short need
+
+### State Serialization Checks
+- [x] `hyd_ctrl` deserialization with dict guard
+- [x] `hyd_ctrl` persisted to traderData
+- [x] trim branch keeps only scalar fields (`prev_mp`, `adverse_up_streak`, `derisk_until`, `capture_until`)
+
+### Safety Checks
+- [x] Global clamping unchanged
+- [x] Hard caps (`hard_long`, `hard_short`) unchanged
+- [x] Module A untouched
