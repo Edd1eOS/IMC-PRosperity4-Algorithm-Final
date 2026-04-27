@@ -49,15 +49,15 @@ POS_LIMIT = {HYDRO: 50, VELVET: 20}
 
 # ── HYDROGEL parameters ───────────────────────────────────────────────────────
 H_MIN_SPREAD = 12   # skip quoting when natural spread < 12 ticks
-H_SIZE       = 4    # units per side per quote
+H_SIZE       = 8    # units per side per quote
 H_SOFT_CAP   = 20   # stop adding to one side when |pos| >= this (50% of hard limit)
 H_SKEW       = 1.2  # ticks of quote-level skew per unit of inventory
 H_TAKE       = 999  # aggressive take disabled (takes are net-negative; passive fills are the edge)
 
 # ── VELVETFRUIT parameters ────────────────────────────────────────────────────
 V_MIN_SPREAD = 4    # natural spread avg = 5; skip when it collapses to <= 3
-V_SIZE       = 2    # units per side
-V_SOFT_CAP   = 8    # 40% of hard limit (20)
+V_SIZE       = 10   # units per side (larger size captures full flow per fill opportunity)
+V_SOFT_CAP   = 20   # 100% of hard limit (20)
 V_SKEW       = 1.2
 V_TAKE       = 999  # aggressive take disabled
 
