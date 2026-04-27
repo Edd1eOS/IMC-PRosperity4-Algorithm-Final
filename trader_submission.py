@@ -70,7 +70,7 @@ VEV_SIGMA_TICK     = 0.000217             # historical vol per local tick (3-day
 VEV_PREMIUM        = 1.20                 # sell when market bid > BS_fair * VEV_PREMIUM ...
 VEV_MIN_EDGE       = 2                    # ... + VEV_MIN_EDGE absolute ticks
 VEV_SIZE           = 5                    # units per aggressive sell
-VEV_LIMIT          = 100                  # max short position per strike
+VEV_LIMIT          = 400                  # max short position per strike
 
 
 # ── Black-Scholes primitives (for VEV option fair-value) ─────────────────────
